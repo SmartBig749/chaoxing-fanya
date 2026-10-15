@@ -47,8 +47,10 @@ class SessionManager:
         self._session.mount("https://", HTTPAdapter(max_retries=10))
         self._session.mount("http://", HTTPAdapter(max_retries=10))
         self._session.request = functools.partial(self._session.request, timeout=5)
-        # For debug purposes
-        # self._session.verify=False
+        # Disable SSL verification for compatibility
+        self._session.verify = False
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         self._session.headers.clear()
         self._session.headers.update(gc.HEADERS)
         self._session.cookies.update(use_cookies())
@@ -135,6 +137,9 @@ class Chaoxing:
             return {"status": True, "msg": "登录成功"}
 
         _session = requests.Session()
+        _session.verify = False
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         _url = "https://passport2.chaoxing.com/fanyalogin"
         _data = {
             "fid": "-1",
@@ -165,6 +170,9 @@ class Chaoxing:
         test_session = requests.Session()
         test_session.headers.update(gc.HEADERS)
         test_session.cookies.update(session.cookies.get_dict())
+        test_session.verify = False
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
         try:
             resp = test_session.post(

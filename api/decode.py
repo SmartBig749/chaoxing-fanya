@@ -30,6 +30,13 @@ except ImportError:
     PIL_AVAILABLE = False
 
 ENABLE_LOCAL_OCR = os.environ.get("CHAOXING_ENABLE_OCR", "0").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+# PaddlePaddle 3.x 的 oneDNN(MKLDNN) 后端在部分算子上会抛 NotImplementedError：
+#   ConvertPirAttribute2RuntimeAttribute not support [pir::ArrayAttribute<pir::DoubleAttribute>]
+#   (at ..\paddle\fluid\framework\new_executor\instruction\onednn\onednn_instruction.cc:118)
+# 该异常发生在推理阶段，会被下层 except 吞掉，导致 OCR 静默失效。
+# 故默认关闭 MKLDNN；如需恢复（例如换用无此 bug 的 PaddlePaddle 版本）可设 CHAOXING_ENABLE_MKLDNN=1
+ENABLE_MKLDNN = os.environ.get("CHAOXING_ENABLE_MKLDNN", "0").strip().lower() in {"1", "true", "yes", "y", "on"}
 _PADDLE_OCR_ENGINE = None
 _PADDLE_OCR_INITIALIZED = False
 _PADDLE_OCR_DEVICE = None  # 记录当前 OCR 引擎运行的设备（gpu / cpu）
@@ -78,6 +85,8 @@ def _init_paddle_ocr(preferred_device: Optional[str] = None):
                     # - det_db_box_thresh: 降低框检测阈值，保留更多候选区域
                     # - det_db_unclip_ratio: 增大文本框扩展比例，避免裁切边缘
                     # - use_angle_cls: 启用方向分类，处理倾斜文字
+                    # - enable_mkldnn: 默认关闭，规避 PaddlePaddle 3.x oneDNN 后端的
+                    #   NotImplementedError（详见文件顶部 ENABLE_MKLDNN 注释）
                     engine = PaddleOCR(
                         lang="ch",
                         device=device,
@@ -85,6 +94,7 @@ def _init_paddle_ocr(preferred_device: Optional[str] = None):
                         det_db_box_thresh=0.4,
                         det_db_unclip_ratio=1.8,
                         use_angle_cls=True,
+                        enable_mkldnn=ENABLE_MKLDNN,
                     )
                     _PADDLE_OCR_ENGINE = engine
                     _PADDLE_OCR_DEVICE = device

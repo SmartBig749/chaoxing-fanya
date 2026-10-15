@@ -168,16 +168,20 @@ def init_config():
 
 
 def init_chaoxing(common_config, tiku_config):
-    """初始化超星实例"""
+    """初始化超星实例
+
+    注意：本函数不再读取 stdin。历史上缺凭据时会 input()，
+    在 Web 路径下会让后台线程永久阻塞。交互式补参由 CLI 入口负责。
+    """
     username = common_config.get("username", "")
     password = common_config.get("password", "")
     use_cookies = common_config.get("use_cookies", False)
-    
-    # 如果没有提供用户名密码，从命令行获取
+
     if (not username or not password) and not use_cookies:
-        username = input("请输入你的手机号, 按回车确认\n手机号:")
-        password = input("请输入你的密码, 按回车确认\n密码:")
-    
+        raise InputFormatError(
+            "缺少登录凭据：请提供手机号与密码，或启用 Cookie 登录"
+        )
+
     account = Account(username, password)
     
     # 设置题库
@@ -310,7 +314,12 @@ class JobProcessor:
                 return
 
             # 处理单个章节，并在需要时通过 config 中的回调上报章节完成进度
-            task.result = process_chapter(self.chaoxing, self.course, task.point, self.speed, self.config)
+            # 异常不能让线程死掉，否则该章节的 task_done 永远不会被调用，queue.join 会永久卡死
+            try:
+                task.result = process_chapter(self.chaoxing, self.course, task.point, self.speed, self.config)
+            except Exception as e:
+                logger.warning("章节处理异常: {}, 错误: {}", task.point["title"], e)
+                task.result = ChapterResult.ERROR
 
             match task.result:
                 case ChapterResult.SUCCESS:
@@ -381,8 +390,15 @@ def process_chapter(chaoxing: Chaoxing, course:dict[str, Any], point:dict[str, A
             except Exception as e:
                 logger.debug(f"调用 chapter_start_callback 时出错: {e}")
     if point["has_finished"]:
-        logger.info(f'章节：{point["title"]} 已完成所有任务点')
-        # 已经在超星端标记为完成的章节，这里直接视为成功，但不再重复回调
+        logger.info(f'⏭️ 跳过已完成章节：{point["title"]}')
+        # 已完成章节：通知外部标记为 skipped（防止重复学习）
+        if config is not None:
+            callback = config.get("chapter_done_callback")
+            if callable(callback):
+                try:
+                    callback(course, point)
+                except Exception as e:
+                    logger.debug(f"调用 chapter_done_callback 时出错: {e}")
         return ChapterResult.SUCCESS
     
     # 随机等待，避免请求过快
@@ -433,6 +449,12 @@ def process_course(chaoxing: Chaoxing, course:dict[str, Any], config: dict):
         course["courseId"], course["clazzId"], course["cpi"]
     )
 
+    # 按「章节选择」配置过滤（未配置时学习全部章节）
+    points = filter_points(point_list["points"], course, config)
+    if not points:
+        logger.warning(f"课程 {course['title']} 没有需要学习的章节（章节选择为空），已跳过")
+        return
+
     # 为了支持课程任务回滚, 采用下标方式遍历任务点
 
     _old_format_sizeof = tqdm.format_sizeof
@@ -441,7 +463,7 @@ def process_course(chaoxing: Chaoxing, course:dict[str, Any], config: dict):
 
     tasks=[]
 
-    for i, point in enumerate(point_list["points"]):
+    for i, point in enumerate(points):
         task = ChapterTask(point=point, index=i)
         tasks.append(task)
     p = JobProcessor(chaoxing, course, tasks, config)
@@ -469,20 +491,64 @@ def process_course(chaoxing: Chaoxing, course:dict[str, Any], config: dict):
 
 
 
+def normalize_chapter_selection(config: dict | None, course_id) -> set[str] | None:
+    """解析某一门课程的章节选择配置。
+
+    返回值含义：
+      - None        —— 不限制，学习该课程的全部章节（默认行为）
+      - set[str]    —— 只学习集合内的章节（可能为空集，表示该课程不学任何章节）
+
+    兼容两种配置形态：
+      - 简写:   {"<courseId>": ["id1", "id2"]}
+      - 推荐:   {"<courseId>": {"mode": "custom", "ids": ["id1", "id2"]}}
+    其中 mode 不为 "custom" 时视为不限制。
+    """
+    selection = (config or {}).get("chapter_selection") or {}
+    if not isinstance(selection, dict):
+        # 配置形态非法（例如 config.ini 里写成了字符串），按不限制处理，避免误过滤
+        return None
+
+    entry = selection.get(str(course_id))
+    if entry is None:
+        return None
+
+    if isinstance(entry, dict):
+        if entry.get("mode", "custom") != "custom":
+            return None
+        ids = entry.get("ids") or []
+    elif isinstance(entry, (list, tuple, set)):
+        ids = entry
+    else:
+        return None
+
+    return {str(i) for i in ids if str(i).strip()}
+
+
+def filter_points(points: list[dict[str, Any]], course: dict[str, Any], config: dict | None, verbose: bool = True) -> list[dict[str, Any]]:
+    """按章节选择配置过滤章节点，未配置时返回全部章节。"""
+    allowed = normalize_chapter_selection(config, course.get("courseId"))
+    if allowed is None:
+        return points
+
+    filtered = [p for p in points if str(p.get("id")) in allowed]
+    if verbose and len(filtered) != len(points):
+        logger.info(
+            f"章节选择生效 -> {course.get('title')}: 共 {len(points)} 章, 仅学习选中的 {len(filtered)} 章"
+        )
+    return filtered
+
+
 def filter_courses(all_course, course_list):
-    """过滤要学习的课程"""
+    """过滤要学习的课程
+
+    不再在此处读取 stdin：交互式补参已下沉到 CLI 入口（filter_courses_interactive）。
+    Web 路径由 app.py 在调用前完成校验，未匹配到课程时直接报错，
+    避免历史上「匹配不到就悄悄学全部课程」的兜底行为。
+    """
     if not course_list:
-        # 手动输入要学习的课程ID列表
-        print("*" * 10 + "课程列表" + "*" * 10)
-        for course in all_course:
-            print(f"ID: {course['courseId']} 课程名: {course['title']}")
-        print("*" * 28)
-        try:
-            course_list = input(
-                "请输入想要学习的课程列表,以逗号分隔,例: 2151141,189191,198198\n"
-            ).split(",")
-        except Exception as e:
-            raise InputFormatError("输入格式错误") from e
+        raise InputFormatError(
+            "未指定要学习的课程：Web 端请先成功加载课程列表并选择课程，CLI 端请通过配置或交互输入指定"
+        )
 
     # 筛选需要学习的课程
     course_task = []
@@ -491,12 +557,34 @@ def filter_courses(all_course, course_list):
         if course["courseId"] in course_list and course["courseId"] not in course_ids:
             course_task.append(course)
             course_ids.append(course["courseId"])
-    
-    # 如果没有指定课程，则学习所有课程
+
     if not course_task:
-        course_task = all_course
-    
+        available = ", ".join(str(c.get("courseId")) for c in all_course) or "（账号下没有课程）"
+        raise InputFormatError(
+            f"所选课程在当前账号下不存在，未匹配到任何课程。可选课程ID: {available}"
+        )
+
     return course_task
+
+
+def filter_courses_interactive(all_course, course_list):
+    """CLI 专用的课程选择：未指定时打印课程列表并读取 stdin。"""
+    if course_list:
+        return filter_courses(all_course, course_list)
+
+    print("*" * 10 + "课程列表" + "*" * 10)
+    for course in all_course:
+        print(f"ID: {course['courseId']} 课程名: {course['title']}")
+    print("*" * 28)
+    try:
+        raw = input("请输入想要学习的课程列表,以逗号分隔,例: 2151141,189191,198198\n")
+    except Exception as e:
+        raise InputFormatError("输入格式错误") from e
+
+    picked = [item.strip() for item in str(raw or "").split(",") if item.strip()]
+    if not picked:
+        raise InputFormatError("未输入任何课程ID，已取消")
+    return filter_courses(all_course, picked)
 
 
 def format_time(num, suffix='', divisor=''):
@@ -511,6 +599,24 @@ def format_time(num, suffix='', divisor=''):
     return f"{mins:02d}:{sec:02d}"
 
 
+def prompt_missing_cli_credentials(common_config):
+    """CLI 专用的登录凭据补参（Web 路径不会走到这里）。"""
+    use_cookies = common_config.get("use_cookies", False)
+    username = common_config.get("username", "")
+    password = common_config.get("password", "")
+
+    if not use_cookies and (not username or not password):
+        print("未检测到登录凭据，请手动输入：")
+        if not username:
+            username = input("请输入你的手机号, 按回车确认\n手机号:").strip()
+        if not password:
+            password = input("请输入你的密码, 按回车确认\n密码:").strip()
+        common_config["username"] = username
+        common_config["password"] = password
+
+    return common_config
+
+
 def main():
     """主程序入口"""
     try:
@@ -521,8 +627,8 @@ def main():
         common_config["speed"] = min(2.0, max(1.0, common_config.get("speed", 1.0)))
         common_config["notopen_action"] = common_config.get("notopen_action", "retry")
         
-        # 初始化超星实例
-        chaoxing = init_chaoxing(common_config, tiku_config)
+        # 初始化超星实例（CLI 下缺凭据时在此交互补参）
+        chaoxing = init_chaoxing(prompt_missing_cli_credentials(common_config), tiku_config)
         
         # 设置外部通知
         notification = Notification()
@@ -538,8 +644,8 @@ def main():
         # 获取所有的课程列表
         all_course = chaoxing.get_course_list()
         
-        # 过滤要学习的课程
-        course_task = filter_courses(all_course, common_config.get("course_list"))
+        # 过滤要学习的课程（CLI 下未指定时在此交互选择）
+        course_task = filter_courses_interactive(all_course, common_config.get("course_list"))
         
         # 开始学习
         logger.info(f"课程列表过滤完毕, 当前课程任务数量: {len(course_task)}")

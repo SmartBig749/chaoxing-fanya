@@ -167,3 +167,10 @@ get-pip.py
 web/node_modules/
 web/dist/
 web/.vite/
+
+# 本地敏感数据备份（含 Cookie / API Token，禁止提交）
+*.bak
+*.bak.*
+
+# 工作区内部产物（记忆、审查报告、构建台账等）
+.workbuddy/
