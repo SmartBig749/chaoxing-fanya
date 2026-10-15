@@ -14,7 +14,9 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
+# 必须锚定到仓库根目录：写成 `lib/` 会匹配任意层级名为 lib 的目录，
+# 曾因此静默吞掉 web/src/lib/ 下的 5 个前端源码文件。
+/lib/
 lib64/
 parts/
 sdist/
@@ -162,6 +164,8 @@ chaoxing_portable.zip
 portable_build/
 python-embed.zip
 get-pip.py
+# 源码目录打包等临时产物（曾出现 web/src/lib.zip 干扰提交）
+*.zip
 
 # Frontend
 web/node_modules/
